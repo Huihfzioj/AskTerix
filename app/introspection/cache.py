@@ -27,9 +27,10 @@ def deserialize(raw : str) -> DatabaseSnapshot:
         for t in payload["tables"]
     ]
     return DatabaseSnapshot(
-        tables=tables,
-        schemas=payload["schemas"],
-        generated_at=datetime.fromisoformat(payload["generated_at"]),
+    tables=tables,
+    schemas=payload["schemas"],
+    generated_at=datetime.fromisoformat(payload["generated_at"]),
+    enum_types={k: list(v) for k, v in payload.get("enum_types", {}).items()},
     )
 
 class RedisSchemaCache:

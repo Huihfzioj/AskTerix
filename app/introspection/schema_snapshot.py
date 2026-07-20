@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from sqlalchemy import inspect, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 SYSTEM_SCHEMAS = {"information_schema", "pg_catalog", "pg_toast"}
 
@@ -31,6 +31,18 @@ class IndexInfo:
 
 
 @dataclass
+class ViewDependency:
+    schema: str
+    name: str
+    kind: str
+    columns: list[str] = field(default_factory=list)
+
+    @property
+    def qualified_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+@dataclass
 class TableInfo:
     schema: str
     name: str
@@ -49,6 +61,7 @@ class DatabaseSnapshot:
     tables: list[TableInfo]
     schemas: list[str]
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    enum_types: dict[str, list[str]] = field(default_factory=dict)
 
     def render_for_llm(self, table_filter: list[str] | None = None) -> str:
         tables = self.tables
@@ -58,8 +71,16 @@ class DatabaseSnapshot:
 
         lines = [f"SCHEMAS: {', '.join(self.schemas)}", ""]
 
+        used = {c.type for t in tables for c in t.columns} & self.enum_types.keys()
+        if used:
+            lines.append("ENUMS:")
+            for name in sorted(used):
+                lines.append(f"  {name}: {' | '.join(self.enum_types[name])}")
+            lines.append("")
+
         for table in tables:
-            lines.append(f"TABLE {table.qualified_name} (~{table.approx_row_count:,} rows)")
+            count = f"~{table.approx_row_count:,} rows" if table.approx_row_count >=0 else "row count unknown"
+            lines.append(f"TABLE {table.qualified_name} ({count})")
             for col in table.columns:
                 pk_marker = " [PK]" if col.is_primary_key else ""
                 null_marker = "" if col.nullable else " NOT NULL"
@@ -96,18 +117,74 @@ def list_schemas(engine: Engine) -> list[str]:
     return [r[0] for r in rows if r[0] not in SYSTEM_SCHEMAS]
 
 
-def _get_approx_row_count(engine: Engine, schema: str, table_name: str) -> int:
+def _get_approx_row_counts(engine: Engine, schemas: list[str]) -> dict[tuple[str, str], int]:
     with engine.connect() as conn:
-        result = conn.execute(
+        rows = conn.execute(
             text("""
-                SELECT c.reltuples::bigint
+                SELECT n.nspname, c.relname, c.reltuples::bigint
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = :schema AND c.relname = :name
+                WHERE c.relkind IN ('r', 'p', 'f', 'm')
+                  AND n.nspname = ANY(:schemas)
             """),
-            {"schema": schema, "name": table_name},
-        ).scalar()
-        return int(result) if result is not None else 0
+            {"schemas": schemas},
+        ).fetchall()
+    return {(r[0], r[1]): int(r[2]) for r in rows}
+
+
+_VIEW_DEPENDENCY_QUERY = text("""
+    SELECT DISTINCT
+        view_ns.nspname   AS view_schema,
+        view_rel.relname  AS view_name,
+        src_ns.nspname    AS source_schema,
+        src.relname       AS source_name,
+        src.relkind       AS source_kind,
+        att.attname       AS source_column
+    FROM pg_depend dep
+    JOIN pg_rewrite rw
+      ON dep.objid = rw.oid
+     AND dep.classid = 'pg_rewrite'::regclass
+    JOIN pg_class view_rel ON rw.ev_class = view_rel.oid
+    JOIN pg_namespace view_ns ON view_rel.relnamespace = view_ns.oid
+    JOIN pg_class src ON dep.refobjid = src.oid
+    JOIN pg_namespace src_ns ON src.relnamespace = src_ns.oid
+    LEFT JOIN pg_attribute att
+      ON att.attrelid = src.oid
+     AND att.attnum = dep.refobjsubid
+    WHERE view_rel.relkind IN ('v', 'm')
+      AND src.relkind IN ('r', 'v', 'm', 'p', 'f')
+      AND view_rel.oid <> src.oid
+      AND src_ns.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+    ORDER BY 1, 2, 3, 4, 6
+""")
+
+
+def get_view_dependencies(
+    bind: Engine | Connection,
+) -> dict[tuple[str, str], list[ViewDependency]]:
+    if isinstance(bind, Engine):
+        with bind.connect() as conn:
+            rows = conn.execute(_VIEW_DEPENDENCY_QUERY).fetchall()
+    else:
+        rows = bind.execute(_VIEW_DEPENDENCY_QUERY).fetchall()
+
+    deps: dict[tuple[str, str], dict[tuple[str, str], ViewDependency]] = {}
+    for view_schema, view_name, src_schema, src_name, src_kind, src_column in rows:
+        sources = deps.setdefault((view_schema, view_name), {})
+        dependency = sources.get((src_schema, src_name))
+        if dependency is None:
+            dependency = ViewDependency(
+                schema=src_schema, name=src_name, kind=src_kind, columns=[]
+            )
+            sources[(src_schema, src_name)] = dependency
+        # NULL column means a whole-relation dependency, which carries no column name.
+        if src_column is not None and src_column not in dependency.columns:
+            dependency.columns.append(src_column)
+
+    return {
+        view: sorted(sources.values(), key=lambda d: (d.schema, d.name))
+        for view, sources in deps.items()
+    }
 
 
 def introspect_database(engine: Engine, schemas: list[str] | None = None) -> DatabaseSnapshot:
@@ -116,22 +193,28 @@ def introspect_database(engine: Engine, schemas: list[str] | None = None) -> Dat
     target_schemas = schemas if schemas is not None else list_schemas(engine)
     default_schema = inspector.default_schema_name
 
+    enum_types : dict[str, list[str]] = {}
+    row_counts = _get_approx_row_counts(engine, target_schemas)
     tables: list[TableInfo] = []
     for schema in target_schemas:
         for table_name in inspector.get_table_names(schema=schema):
             pk_constraint = inspector.get_pk_constraint(table_name, schema=schema)
             pk_columns = set(pk_constraint.get("constrained_columns") or [])
 
-            columns = [
-                ColumnInfo(
-                    name=col["name"],
-                    type=str(col["type"]),
-                    nullable=col["nullable"],
-                    default=col.get("default"),
-                    is_primary_key=col["name"] in pk_columns,
+            columns = []
+            for col in inspector.get_columns(table_name, schema=schema):
+                labels = getattr(col["type"], "enums", None)
+                if labels:
+                    enum_types[col["type"].name] = list(labels)
+                columns.append(
+                    ColumnInfo(
+                        name=col["name"],
+                        type=col["type"].compile(dialect=engine.dialect),
+                        nullable=col["nullable"],
+                        default=col.get("default"),
+                        is_primary_key=col["name"] in pk_columns,
+                    )
                 )
-                for col in inspector.get_columns(table_name, schema=schema)
-            ]
 
             foreign_keys = [
                 ForeignKeyInfo(
@@ -155,8 +238,8 @@ def introspect_database(engine: Engine, schemas: list[str] | None = None) -> Dat
                     columns=columns,
                     foreign_keys=foreign_keys,
                     indexes=indexes,
-                    approx_row_count=_get_approx_row_count(engine, schema, table_name),
+                    approx_row_count=row_counts.get((schema, table_name), -1),
                 )
             )
 
-    return DatabaseSnapshot(tables=tables, schemas=target_schemas)
+    return DatabaseSnapshot(tables=tables, schemas=target_schemas, enum_types=enum_types)
