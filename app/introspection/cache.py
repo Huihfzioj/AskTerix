@@ -67,7 +67,7 @@ class RedisSchemaCache:
             if cached is not None:
                 return deserialize(cached)
             snapshot = introspect_database(engine)
-            self.redis.setex(key, self.ttl, serialize(snapshot))
+            self.redis.set(key, serialize(snapshot), ex=self.ttl)
             return snapshot
         finally:
             if acquired:
