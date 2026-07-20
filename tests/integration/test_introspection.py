@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import text
 
 from app.introspection.cache import deserialize, serialize
+from app.introspection.rendering import render_for_ask
 
 pytestmark = pytest.mark.integration
 
@@ -103,6 +104,6 @@ def test_primary_keys_match_catalog(snapshot, engine):
 
 
 def test_render_is_non_empty_and_lists_every_table(snapshot):
-    rendered = snapshot.render_for_llm()
+    rendered = render_for_ask(snapshot)
     for table in snapshot.tables:
         assert f"TABLE {table.qualified_name} " in rendered

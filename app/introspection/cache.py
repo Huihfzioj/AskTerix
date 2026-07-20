@@ -3,7 +3,7 @@ from dataclasses import asdict
 from datetime import datetime
 import redis
 from sqlalchemy.engine import Engine
-from app.introspection.schema_snapshot import ColumnInfo, DatabaseSnapshot, ForeignKeyInfo, IndexInfo, TableInfo, introspect_database
+from app.introspection.schema_snapshot import ColumnInfo, DatabaseSnapshot, ForeignKeyInfo, IndexInfo, TableInfo, ViewDependency, ViewInfo, introspect_database
 
 DEFAULT_TTL_SECONDS = 300
 LOCK_TIMEOUT_SECONDS = 30
@@ -26,11 +26,24 @@ def deserialize(raw : str) -> DatabaseSnapshot:
         )
         for t in payload["tables"]
     ]
+    views = [
+        ViewInfo(
+            schema=v["schema"],
+            name=v["name"],
+            is_materialized=v["is_materialized"],
+            columns=[ColumnInfo(**c) for c in v["columns"]],
+            definition=v["definition"],
+            depends_on=[ViewDependency(**d) for d in v["depends_on"]],
+            approx_row_count=v["approx_row_count"],
+        )
+        for v in payload.get("views", [])
+    ]
     return DatabaseSnapshot(
     tables=tables,
     schemas=payload["schemas"],
     generated_at=datetime.fromisoformat(payload["generated_at"]),
     enum_types={k: list(v) for k, v in payload.get("enum_types", {}).items()},
+    views=views,
     )
 
 class RedisSchemaCache:
