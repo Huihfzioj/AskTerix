@@ -1,5 +1,6 @@
 """Rendering tests. These build snapshots by hand and never touch a database."""
 
+from app.introspection.rendering import render_for_ask, render_for_migration
 from app.introspection.schema_snapshot import (
     ColumnInfo,
     DatabaseSnapshot,
@@ -34,7 +35,7 @@ def test_negative_row_count_renders_as_unknown():
         tables=[make_table("t", [column("id", "UUID")], approx_row_count=-1)],
         schemas=["public"],
     )
-    rendered = snapshot.render_for_llm()
+    rendered = render_for_migration(snapshot)
 
     assert "row count unknown" in rendered
     assert "-1" not in rendered
@@ -45,7 +46,7 @@ def test_known_row_count_renders_with_thousands_separator():
         tables=[make_table("t", [column("id", "UUID")], approx_row_count=2198)],
         schemas=["public"],
     )
-    assert "(~2,198 rows)" in snapshot.render_for_llm()
+    assert "(~2,198 rows)" in render_for_migration(snapshot)
 
 
 def test_zero_row_count_is_not_reported_as_unknown():
@@ -53,7 +54,7 @@ def test_zero_row_count_is_not_reported_as_unknown():
         tables=[make_table("t", [column("id", "UUID")], approx_row_count=0)],
         schemas=["public"],
     )
-    rendered = snapshot.render_for_llm()
+    rendered = render_for_migration(snapshot)
 
     assert "(~0 rows)" in rendered
     assert "unknown" not in rendered
@@ -66,7 +67,7 @@ def test_enum_labels_appear_once_regardless_of_column_count():
         schemas=["public"],
         enum_types={"cloudtype": ["AWS", "AZURE", "GCP"]},
     )
-    rendered = snapshot.render_for_llm()
+    rendered = render_for_migration(snapshot)
 
     assert rendered.count("AWS | AZURE | GCP") == 1
     assert rendered.count("cloudtype") == 6  # one legend entry, five column references
@@ -85,11 +86,11 @@ def test_legend_omits_enums_not_used_by_filtered_tables():
         },
     )
 
-    rendered = snapshot.render_for_llm(table_filter=["public.uses_enum"])
+    rendered = render_for_migration(snapshot, table_filter=["public.uses_enum"])
     assert "cloudtype: AWS | AZURE | GCP" in rendered
     assert "alerttype" not in rendered
 
-    rendered = snapshot.render_for_llm(table_filter=["public.plain"])
+    rendered = render_for_migration(snapshot, table_filter=["public.plain"])
     assert "ENUMS:" not in rendered
 
 
@@ -107,7 +108,7 @@ def test_column_markers_are_rendered():
         ],
         schemas=["public"],
     )
-    rendered = snapshot.render_for_llm()
+    rendered = render_for_migration(snapshot)
 
     assert "- id: UUID [PK] NOT NULL" in rendered
     assert "- pct: DOUBLE PRECISION DEFAULT 80.0" in rendered

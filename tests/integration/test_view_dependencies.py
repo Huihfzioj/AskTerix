@@ -4,7 +4,11 @@ transaction. Nothing is ever committed, so a crashed test leaves no DDL behind."
 import pytest
 from sqlalchemy import text
 
-from app.introspection.schema_snapshot import get_view_dependencies
+from app.introspection.schema_snapshot import (
+    find_affected_views,
+    get_view_dependencies,
+    introspect_views,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -108,24 +112,81 @@ def test_a_view_never_depends_on_itself(deps):
         assert (schema, name) not in {(d.schema, d.name) for d in dependencies}
 
 
-def test_result_ordering_is_deterministic(views):
-    """Snapshots are cached and compared by value, so unstable ordering would
-    make an unchanged schema look changed."""
-    first = get_view_dependencies(views)
-    second = get_view_dependencies(views)
-    assert first == second
+def test_dependencies_are_returned_in_sorted_order(deps):
+    """Asserts the ordering property itself. Comparing two consecutive runs would
+    pass by luck on an unordered query; this cannot. Snapshots are cached and
+    compared by value, so unstable ordering makes an unchanged schema look changed."""
+    for dependencies in deps.values():
+        keys = [(d.schema, d.name) for d in dependencies]
+        assert keys == sorted(keys)
 
 
-def test_dropping_a_column_can_be_traced_to_affected_views(deps):
-    """The F3 query this data exists to answer: who breaks if users.email goes?"""
-    affected = {
-        view
-        for view, dependencies in deps.items()
-        for d in dependencies
-        if d.qualified_name == "public.users" and "email" in d.columns
-    }
+def test_direct_column_dependants_are_found(deps):
+    """The F3 question this data exists to answer: who breaks if users.email goes?"""
+    affected = find_affected_views(deps, "public", "users", column="email")
     assert ("public", "v_simple") in affected
     assert ("public", "v_join") in affected
-    # v_on_view reads users.email only through v_simple, so it is not a direct
-    # dependant -- reaching it requires walking the chain transitively.
-    assert ("public", "v_on_view") not in affected
+
+
+def test_column_drop_propagates_through_a_view_chain(deps):
+    """v_on_view reads users.email only through v_simple. Dropping the column
+    requires CASCADE, which drops v_simple and therefore v_on_view too."""
+    affected = find_affected_views(deps, "public", "users", column="email")
+    assert ("public", "v_on_view") in affected
+
+
+def test_column_drop_spares_whole_relation_dependants(deps):
+    """v_agg is SELECT count(*) FROM organizations -- it reads no column, so
+    dropping organizations.name does not break it."""
+    affected = find_affected_views(deps, "public", "organizations", column="name")
+    assert ("public", "v_agg") not in affected
+    assert ("public", "v_join") in affected
+
+
+def test_relation_drop_includes_whole_relation_dependants(deps):
+    """Dropping the table itself does break the aggregate view."""
+    affected = find_affected_views(deps, "public", "organizations")
+    assert ("public", "v_agg") in affected
+    assert ("public", "v_join") in affected
+
+
+def test_unaffected_relation_yields_nothing(deps):
+    assert find_affected_views(deps, "public", "users", column="password_hash") == set()
+    assert find_affected_views(deps, "public", "pipeline_runs") == set()
+
+
+@pytest.fixture
+def view_infos(views):
+    return {(v.schema, v.name): v for v in introspect_views(views)}
+
+
+def test_every_view_is_introspected(view_infos):
+    assert ALL_VIEWS <= view_infos.keys()
+
+
+def test_view_columns_are_populated(view_infos):
+    """F1 generates SQL against views, so it needs their columns and types."""
+    columns = {c.name: c.type for c in view_infos[("public", "v_simple")].columns}
+    assert columns == {"id": "UUID", "email": "VARCHAR(255)"}
+
+
+def test_view_definition_is_populated(view_infos):
+    definition = view_infos[("public", "v_simple")].definition
+    assert "SELECT" in definition.upper()
+    assert "users" in definition
+
+
+def test_materialized_flag_distinguishes_view_kinds(view_infos):
+    assert view_infos[("public", "mv_accounts")].is_materialized is True
+    assert view_infos[("public", "v_simple")].is_materialized is False
+
+
+def test_plain_views_have_no_row_count(view_infos):
+    """A plain view stores no rows, so a count would be an invented number."""
+    assert view_infos[("public", "v_simple")].approx_row_count is None
+    assert view_infos[("public", "mv_accounts")].approx_row_count is not None
+
+
+def test_view_info_carries_its_dependencies(view_infos):
+    sources = {d.qualified_name for d in view_infos[("public", "v_join")].depends_on}
+    assert sources == {"public.users", "public.organizations"}
